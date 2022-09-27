@@ -163,4 +163,4 @@ if __name__ == '__main__':
         idx_next = torch.multinomial(logits[0], num_samples=1)
         text_next = ''.join(vocab[i] for i in idx_next)
 
-        print(f'loss {loss:.3f} gen {str(text_next)}')
+        print(f'loss {loss:.3f} input {in_text} output {str(text_next)}')
