@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import Dataset
 
 @dataclass
 class ModelConfig:
@@ -53,7 +54,7 @@ class SelfAttention(nn.Module):
         # k: (B, nh, hs, T)
         # karpathy wrote (-2, -1) I wrote (-1,-2). they work the same
         attn = (q @ k.transpose(-1,-2)) / math.sqrt(k.size(-1))
-        attn.masked_fill(self.bias[:, :, :T, :T] == 1, float('-inf'))
+        attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
         attn = attn.softmax(dim=-1)
 
         # attn: (B, nh, T, T)
@@ -135,27 +136,94 @@ class Transformer(nn.Module):
 
 # ================================
 
-vocab = string.printable[:-2]
+# Shamelessly stolen from makemore, becuase data wrangling is boring. Thanks karpathy!
 
-def stot(s):
-    return torch.tensor([vocab.index(c) for c in s], dtype=torch.long)
+class CharDataset(Dataset):
+    def __init__(self, words, chars, max_word_length):
+        self.words = words
+        self.chars = chars
+        self.max_word_length = max_word_length
+        self.stoi = {ch:i+1 for i,ch in enumerate(chars)}
+        self.itos = {i:s for s,i in self.stoi.items()} # inverse mapping
 
-def ttos(t):
-    return ''.join(vocab[i] for i in t)
+    def __len__(self):
+        return len(self.words)
+
+    def contains(self, word):
+        return word in self.words
+
+    def get_vocab_size(self):
+        return len(self.chars) + 1 # all the possible characters and special 0 token
+
+    def get_output_length(self):
+        return self.max_word_length + 1 # <START> token followed by words
+
+    def encode(self, word):
+        ix = torch.tensor([self.stoi[w] for w in word], dtype=torch.long)
+        return ix
+
+    def decode(self, ix):
+        word = ''.join(self.itos[i] for i in ix)
+        return word
+
+    def __getitem__(self, idx):
+        word = self.words[idx]
+        ix = self.encode(word)
+        x = torch.zeros(self.max_word_length + 1, dtype=torch.long)
+        y = torch.zeros(self.max_word_length + 1, dtype=torch.long)
+        x[1:1+len(ix)] = ix
+        y[:len(ix)] = ix
+        y[len(ix)+1:] = -1 # index -1 will mask the loss at the inactive locations (see ignore_index=-1)
+        return x, y
+
+
+def create_datasets(input_file, sep='\n'):
+    # read and clean up data
+    with open(input_file, 'r') as f:
+        data = f.read()
+    words = data.split(sep)
+    words = [w.strip() for w in words] # get rid of any leading or trailing white space
+    words = [w for w in words if w] # get rid of any empty strings
+    chars = sorted(list(set(''.join(words)))) # all the possible characters
+    max_word_length = max(len(w) for w in words)
+
+    # create test and train set
+    test_set_size = min(1000, int(len(words) * 0.1))
+    rp = torch.randperm(len(words)).tolist()
+    train_words = [words[i] for i in rp[test_set_size:]]
+    test_words = [words[i] for i in rp[:test_set_size]]
+
+    # wrap in dataset objects
+    train_dataset = CharDataset(train_words, chars, max_word_length)
+    test_dataset = CharDataset(test_words, chars, max_word_length)
+    return train_dataset, test_dataset
+
+
+def str_sample(x: list):
+    x = x[1:] # remove <START> token
+    crop_index = x.index(0) if 0 in x else len(x)
+    x = x[:crop_index]
+    return train_set.decode(x)
+
+
+# ================================
+
 
 
 if __name__ == '__main__':
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    in_text = "Hello transformer!"
-    target_text = "Hello, programmer!" # must be same length (TODO: pad)
-    x = stot(in_text).unsqueeze(0).to(device)
-    y = stot(target_text).unsqueeze(0).to(device)
-    config = ModelConfig(vocab_size=len(vocab), block_size=100)
+    train_set, test_set = create_datasets('data/names.txt')
+    vocab = train_set.chars
+
+    config = ModelConfig(vocab_size=train_set.get_vocab_size(), block_size=train_set.get_output_length())
+    print(config)
     transformer = Transformer(config).to(device)
     optim = torch.optim.Adam(transformer.parameters())
 
-    for _ in range(100):
+    for x,y in train_set:
+        in_text = str_sample(x.tolist())
+        x,y = x.unsqueeze(0).to(device), y.unsqueeze(0).to(device)
         logits, loss = transformer(x, targets=y)
         transformer.zero_grad()
         loss.backward()
@@ -163,6 +231,7 @@ if __name__ == '__main__':
 
         logits = logits.softmax(dim=-1)
         idx_next = torch.multinomial(logits[0], num_samples=1)
-        text_next = ''.join(vocab[i] for i in idx_next)
+        # TODO: Remove hack; <START> token is not in model outputs, but is in samples.
+        text_next = str_sample([0] + idx_next.T[0].tolist())
 
         print(f'loss {loss:.3f} input {in_text} output {str(text_next)}')
