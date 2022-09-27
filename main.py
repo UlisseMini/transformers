@@ -145,12 +145,14 @@ def ttos(t):
 
 
 if __name__ == '__main__':
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
     in_text = "Hello transformer!"
     target_text = "Hello, programmer!" # must be same length (TODO: pad)
-    x = stot(in_text).unsqueeze(0)
-    y = stot(target_text).unsqueeze(0)
+    x = stot(in_text).unsqueeze(0).to(device)
+    y = stot(target_text).unsqueeze(0).to(device)
     config = ModelConfig(vocab_size=len(vocab), block_size=100)
-    transformer = Transformer(config)
+    transformer = Transformer(config).to(device)
     optim = torch.optim.Adam(transformer.parameters())
 
     for _ in range(100):
