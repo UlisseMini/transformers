@@ -107,7 +107,7 @@ class Transformer(nn.Module):
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
 
 
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         # idx is a LongTensor of shape (B, T) with values in [0, vocab_size).
         device = idx.device
         B, T = idx.size()
@@ -120,21 +120,47 @@ class Transformer(nn.Module):
             z = block(z)
         z = self.transformer.ln_f(z)
         logits = self.lm_head(z)
-        return logits
+
+        loss = None
+        if targets is not None:
+            # flatten stuff
+            # logits   (B, T, vocab_size)
+            # logits'  (B*T, vocab_size)
+            # targets' (B*T)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+        return logits, loss
+
+
+
+# ================================
+
+vocab = string.printable[:-2]
+
+def stot(s):
+    return torch.tensor([vocab.index(c) for c in s], dtype=torch.long)
+
+def ttos(t):
+    return ''.join(vocab[i] for i in t)
 
 
 if __name__ == '__main__':
-    vocab = string.printable[:-2]
     in_text = "Hello transformer!"
-    encoded = torch.tensor([vocab.index(c) for c in in_text], dtype=torch.long).unsqueeze(0)
+    target_text = "Hello, programmer!" # must be same length (TODO: pad)
+    x = stot(in_text).unsqueeze(0)
+    y = stot(target_text).unsqueeze(0)
     config = ModelConfig(vocab_size=len(vocab), block_size=100)
-
-    print('INPUT', in_text)
     transformer = Transformer(config)
-    logits = transformer(encoded)
-    print(logits.shape)
-    logits = logits.softmax(dim=-1)
-    print(logits)
-    idx_next = torch.multinomial(logits[0], num_samples=1)
-    text_next = ''.join(vocab[i] for i in idx_next)
-    print('OUTPUT', text_next)
+    optim = torch.optim.Adam(transformer.parameters())
+
+    for _ in range(100):
+        logits, loss = transformer(x, targets=y)
+        transformer.zero_grad()
+        loss.backward()
+        optim.step()
+
+        logits = logits.softmax(dim=-1)
+        idx_next = torch.multinomial(logits[0], num_samples=1)
+        text_next = ''.join(vocab[i] for i in idx_next)
+
+        print(f'loss {loss:.3f} gen {str(text_next)}')
