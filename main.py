@@ -1,11 +1,14 @@
 import math
 import string
+import argparse
+import os
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 @dataclass
 class ModelConfig:
@@ -199,39 +202,147 @@ def create_datasets(input_file, sep='\n'):
     return train_dataset, test_dataset
 
 
-def str_sample(x: list):
-    x = x[1:] # remove <START> token
-    crop_index = x.index(0) if 0 in x else len(x)
-    x = x[:crop_index]
-    return train_set.decode(x)
+
+
+# ================================
+# more stuff stolen from makemore (I do understand it all though!)
+# (theoretically these helpers would be builtin to something like pytorch lightning)
+
+
+@torch.no_grad()
+def generate(model, idx, max_new_tokens, tempature=0.5, top_k=None, do_sample=False):
+    """
+    Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+    the sequence max_new_tokens times, feeding the predictions back into the model each time.
+    Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+    """
+
+    block_size = model.block_size
+    for _ in range(max_new_tokens):
+        # if the sequence is too long, cut it off
+        idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
+        # forward the model to get the logits for the index in the sequence
+        logits, _ = model(idx_cond)
+        # pluck the logits at the final step and scale by desired tempature
+        logits = logits[:, -1, :] / tempature
+        if top_k is not None:
+            v, _ = torch.topk(logits, top_k, dim=-1)
+            logits[logits < v[:, [-1]]] = -float('inf')
+        # apply softmax to convert logits to (normalized) probabilities
+        probs = F.softmax(logits, dim=-1)
+        # either sample from the distribution or take the most likely element
+        if do_sample:
+            idx_next = torch.multinomial(probs, num_samples=1)
+        else:
+            _, idx_next = torch.topk(probs, k=1, dim=-1)
+        # append sampled index to the running sequence and continue
+        idx = torch.cat((idx, idx_next), dim=1)
+
+    return idx
+    
+
+
+def print_samples(num):
+    from tqdm import tqdm
+
+    X_init = torch.zeros(num, 1, dtype=torch.long).to(device)
+    top_k = args.top_k if args.top_k != -1 else None
+    steps = train_set.get_output_length() - 1 # -1 bc <START> token
+    X_samp = generate(model, X_init, steps, top_k=top_k, do_sample=True).to('cpu')
+    samples = []
+    for i in tqdm(range(X_samp.size(0))): # iter over batches
+        row = X_samp[i, 1:].tolist() # skip <START> token
+        crop_index = row.index(0) if 0 in row else len(row)
+        row = row[:crop_index]
+        word_samp = train_set.decode(row)
+        samples.append(word_samp)
+    
+    print('=' * 80)
+    for sample in samples:
+        print(sample)
+        print('-' * 80)
+    print('=' * 80)
+
+
+@torch.inference_mode()
+def evaluate(model, dataset, batch_size=50, max_batches=None):
+    model.eval()
+    loader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=0)
+    losses = []
+    for i, batch in enumerate(loader):
+        batch = [t.to(device) for t in batch]
+        X, Y = batch
+        logits, loss = model(X, Y)
+        losses.append(loss.item())
+        if max_batches is not None and i >= max_batches:
+            break
+    mean_loss = torch.tensor(losses).mean().item()
+    model.train() # reset model back to training mode
+    return mean_loss
 
 
 # ================================
 
 
-
 if __name__ == '__main__':
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    parser = argparse.ArgumentParser(description="Transformers")
+    parser.add_argument('--input-file', type=str, default='data/names.txt', help='path to input file')
+    parser.add_argument('--batch-size', type=int, default=32, help='batch size')
+    parser.add_argument('--seed', type=int, default=3407, help='random seed')
+    parser.add_argument('--resume', action='store_true', help='resume training')
+    parser.add_argument('--sample-only', action='store_true', help='only sample from a pretrained model')
+    parser.add_argument('--work-dir', '-o', type=str, default='out', help='working directory')
+    parser.add_argument('--device', type=str, default='auto', help='device to use')
+    parser.add_argument('--top-k', type=int, default=-1, help='top k sampling')
+    args = parser.parse_args()
 
-    train_set, test_set = create_datasets('data/names.txt')
-    vocab = train_set.chars
+    device = ('cuda' if torch.cuda.is_available() else 'cpu') if args.device == 'auto' else args.device
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    os.makedirs(args.work_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=args.work_dir)
+
+    train_set, test_set = create_datasets(args.input_file)
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4)
 
     config = ModelConfig(vocab_size=train_set.get_vocab_size(), block_size=train_set.get_output_length())
     print(config)
-    transformer = Transformer(config).to(device)
-    optim = torch.optim.Adam(transformer.parameters())
+    model = Transformer(config).to(device)
 
-    for x,y in train_set:
-        in_text = str_sample(x.tolist())
-        x,y = x.unsqueeze(0).to(device), y.unsqueeze(0).to(device)
-        logits, loss = transformer(x, targets=y)
-        transformer.zero_grad()
-        loss.backward()
-        optim.step()
+    if args.resume or args.sample_only:
+        model.load_state_dict(torch.load(os.path.join(args.work_dir, 'model.pt')))
+    if args.sample_only:
+        print_samples(num=10)
+        exit()
 
-        logits = logits.softmax(dim=-1)
-        idx_next = torch.multinomial(logits[0], num_samples=1)
-        # TODO: Remove hack; <START> token is not in model outputs, but is in samples.
-        text_next = str_sample([0] + idx_next.T[0].tolist())
+    print(f"model #params: {sum(p.numel() for p in model.parameters())}")
 
-        print(f'loss {loss:.3f} input {in_text} output {str(text_next)}')
+    # training loop
+    optim = torch.optim.Adam(model.parameters())
+    best_loss = None
+    step = 0
+    for epoch in range(10000):
+        for batch, (x,y) in enumerate(train_loader):
+            step += 1
+            x,y = x.to(device), y.to(device)
+            logits, loss = model(x, targets=y)
+            model.zero_grad(set_to_none=True)
+            loss.backward()
+            optim.step()
+
+            if batch % 10 == 0:
+                print(f'[{epoch=} {batch=}/{len(train_loader)}] loss {loss:.3f}')
+
+            if step % 100 == 0:
+               train_loss = evaluate(model, train_set, batch_size=100, max_batches=10)
+               test_loss  = evaluate(model, test_set,  batch_size=100, max_batches=10)
+               writer.add_scalar("Loss/train", train_loss, step)
+               writer.add_scalar("Loss/test", test_loss, step)
+               writer.flush()
+               print(f"[{epoch=} {batch=}] train loss: {train_loss} test loss: {test_loss}")
+               # save the model to disk if it has improved
+               if best_loss is None or test_loss < best_loss:
+                   out_path = os.path.join(args.work_dir, "model.pt")
+                   print(f"test loss {test_loss} is the best so far, saving model to {out_path}")
+                   torch.save(model.state_dict(), out_path)
+                   best_loss = test_loss
