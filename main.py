@@ -3,6 +3,8 @@ import string
 import argparse
 import os
 from dataclasses import dataclass
+from tqdm import tqdm
+
 
 import torch
 import torch.nn as nn
@@ -210,7 +212,7 @@ def create_datasets(input_file, sep='\n'):
 
 
 @torch.no_grad()
-def generate(model, idx, max_new_tokens, tempature=0.5, top_k=None, do_sample=False):
+def generate(model, idx, max_new_tokens, tempature=0.7, top_k=None, do_sample=False):
     """
     Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
     the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -218,7 +220,7 @@ def generate(model, idx, max_new_tokens, tempature=0.5, top_k=None, do_sample=Fa
     """
 
     block_size = model.block_size
-    for _ in range(max_new_tokens):
+    for _ in tqdm(range(max_new_tokens)):
         # if the sequence is too long, cut it off
         idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
         # forward the model to get the logits for the index in the sequence
@@ -236,6 +238,8 @@ def generate(model, idx, max_new_tokens, tempature=0.5, top_k=None, do_sample=Fa
         else:
             _, idx_next = torch.topk(probs, k=1, dim=-1)
         # append sampled index to the running sequence and continue
+        if (idx_next == 0).all():
+            break
         idx = torch.cat((idx, idx_next), dim=1)
 
     return idx
@@ -243,8 +247,6 @@ def generate(model, idx, max_new_tokens, tempature=0.5, top_k=None, do_sample=Fa
 
 
 def print_samples(num):
-    from tqdm import tqdm
-
     X_init = torch.zeros(num, 1, dtype=torch.long).to(device)
     top_k = args.top_k if args.top_k != -1 else None
     steps = train_set.get_output_length() - 1 # -1 bc <START> token
@@ -312,7 +314,7 @@ if __name__ == '__main__':
     if args.resume or args.sample_only:
         model.load_state_dict(torch.load(os.path.join(args.work_dir, 'model.pt')))
     if args.sample_only:
-        print_samples(num=10)
+        print_samples(num=50)
         exit()
 
     print(f"model #params: {sum(p.numel() for p in model.parameters())}")
