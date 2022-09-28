@@ -1,0 +1,3 @@
+data/stacks.tex filter=lfs diff=lfs merge=lfs -text
+data/analysis.txt filter=lfs diff=lfs merge=lfs -text
+data/linux.c filter=lfs diff=lfs merge=lfs -text
