@@ -1,4 +1,4 @@
-## transformers
+# Transformers
 
 ![gif of training](images/hello-programmer.gif)
 
@@ -9,7 +9,9 @@ Hand-written transformers for learning purposes. Written after reading Karpathy'
 
 ### Stacks project
 
-Training on the [stacks project](https://github.com/stacks/stacks-project) (~730k LOC)
+Training on the [stacks project](https://github.com/stacks/stacks-project) (~730k LOC) with ~2M param model (4 layers, 4 heads, 64 dim embeddings.)
+
+Ideally there'd be more data, [Chinchilla](https://arxiv.org/pdf/2203.15556.pdf) found that you want ~10-20x more tokens then parameters for big models, my model is tiny but the direction should be qualitatively correct. Maybe I'll test this.
 
 ![loss curves](images/stacks-loss.png)
 
