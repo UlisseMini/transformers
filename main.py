@@ -4,6 +4,7 @@ import argparse
 import os
 from dataclasses import dataclass
 from tqdm import tqdm
+from utils import get_char_sentences, get_latex_sentences
 
 
 import torch
@@ -141,68 +142,71 @@ class Transformer(nn.Module):
 
 # ================================
 
-# Shamelessly stolen from makemore, becuase data wrangling is boring. Thanks karpathy!
+# Mostly stolen from makemore, becuase data wrangling is boring. Thanks karpathy!
 
-class CharDataset(Dataset):
-    def __init__(self, words, chars, max_word_length):
-        self.words = words
-        self.chars = chars
-        self.max_word_length = max_word_length
-        self.stoi = {ch:i+1 for i,ch in enumerate(chars)}
+#     tokens = data.split(sentences)
+#     tokens = [w.strip() sentences w in tokens] # get rid of any leading or trailing white space
+#     return sentences
+
+class TokenDataset(Dataset):
+    def __init__(self, sentences, vocab, max_sentence_length):
+        self.sentences = sentences
+        self.vocab = vocab
+        self.max_sentence_length = max_sentence_length
+        self.stoi = {tok:i+1 for i,tok in enumerate(vocab)}
         self.itos = {i:s for s,i in self.stoi.items()} # inverse mapping
 
     def __len__(self):
-        return len(self.words)
+        return len(self.sentences)
 
-    def contains(self, word):
-        return word in self.words
+    def contains(self, token):
+        # token in self.vocab would be faster, but I'm afarid of bugs
+        return token in sentences.tokens
 
     def get_vocab_size(self):
-        return len(self.chars) + 1 # all the possible characters and special 0 token
+        return len(self.vocab) + 1 # all the possible characters and special 0 token
 
     def get_output_length(self):
-        return self.max_word_length + 1 # <START> token followed by words
+        return self.max_sentence_length + 1 # <START> token followed by tokens
 
-    def encode(self, word):
-        ix = torch.tensor([self.stoi[w] for w in word], dtype=torch.long)
+    def encode(self, sentence):
+        ix = torch.tensor([self.stoi[tok] for tok in sentence], dtype=torch.long)
         return ix
 
-    def decode(self, ix):
-        word = ''.join(self.itos[i] for i in ix)
-        return word
+    def decode(self, ix, join_char=''):
+        # TODO: Allow tokenizer to control join_char (or better, join_fn)
+        return ''.join(self.itos[i] for i in ix)
 
     def __getitem__(self, idx):
-        word = self.words[idx]
-        ix = self.encode(word)
-        x = torch.zeros(self.max_word_length + 1, dtype=torch.long)
-        y = torch.zeros(self.max_word_length + 1, dtype=torch.long)
+        sentence = self.sentences[idx]
+        ix = self.encode(sentence)
+        x = torch.zeros(self.max_sentence_length + 1, dtype=torch.long)
+        y = torch.zeros(self.max_sentence_length + 1, dtype=torch.long)
         x[1:1+len(ix)] = ix
         y[:len(ix)] = ix
         y[len(ix)+1:] = -1 # index -1 will mask the loss at the inactive locations (see ignore_index=-1)
         return x, y
 
 
-def create_datasets(input_file, sep='\n'):
+def create_datasets(input_file, get_sentences):
     # read and clean up data
     with open(input_file, 'r') as f:
         data = f.read()
-    words = data.split(sep)
-    words = [w.strip() for w in words] # get rid of any leading or trailing white space
-    words = [w for w in words if w] # get rid of any empty strings
-    chars = sorted(list(set(''.join(words)))) # all the possible characters
-    max_word_length = max(len(w) for w in words)
+
+    sentences = list(get_sentences(data))
+    vocab = sorted(list(set(tok for s in sentences for tok in s)))
+    max_sentence_length = max(len(s) for s in sentences)
 
     # create test and train set
-    test_set_size = min(1000, int(len(words) * 0.1))
-    rp = torch.randperm(len(words)).tolist()
-    train_words = [words[i] for i in rp[test_set_size:]]
-    test_words = [words[i] for i in rp[:test_set_size]]
+    test_set_size = min(1000, int(len(sentences) * 0.1))
+    rp = torch.randperm(len(sentences)).tolist()
+    train_sentences = [sentences[i] for i in rp[test_set_size:]]
+    test_sentences = [sentences[i] for i in rp[:test_set_size]]
 
     # wrap in dataset objects
-    train_dataset = CharDataset(train_words, chars, max_word_length)
-    test_dataset = CharDataset(test_words, chars, max_word_length)
+    train_dataset = TokenDataset(train_sentences, vocab, max_sentence_length)
+    test_dataset = TokenDataset(test_sentences, vocab, max_sentence_length)
     return train_dataset, test_dataset
-
 
 
 
@@ -246,11 +250,10 @@ def generate(model, idx, max_new_tokens, tempature=0.7, top_k=None, do_sample=Fa
     
 
 
-def print_samples(num):
+def print_samples(num, max_len):
     X_init = torch.zeros(num, 1, dtype=torch.long).to(device)
     top_k = args.top_k if args.top_k != -1 else None
-    steps = train_set.get_output_length() - 1 # -1 bc <START> token
-    X_samp = generate(model, X_init, steps, top_k=top_k, do_sample=True).to('cpu')
+    X_samp = generate(model, X_init, max_len, top_k=top_k, do_sample=True).to('cpu')
     samples = []
     for i in tqdm(range(X_samp.size(0))): # iter over batches
         row = X_samp[i, 1:].tolist() # skip <START> token
@@ -262,7 +265,6 @@ def print_samples(num):
     print('=' * 80)
     for sample in samples:
         print(sample)
-        print('-' * 80)
     print('=' * 80)
 
 
@@ -292,10 +294,14 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=32, help='batch size')
     parser.add_argument('--seed', type=int, default=3407, help='random seed')
     parser.add_argument('--resume', action='store_true', help='resume training')
-    parser.add_argument('--sample-only', action='store_true', help='only sample from a pretrained model')
     parser.add_argument('--work-dir', '-o', type=str, default='out', help='working directory')
+    parser.add_argument('--model-file', '-m', type=str, default='model.pt', help='model file')
     parser.add_argument('--device', type=str, default='auto', help='device to use')
     parser.add_argument('--top-k', type=int, default=-1, help='top k sampling')
+    parser.add_argument('--tokenizer', type=str, default='chars', help='tokenizer to use')
+    parser.add_argument('--sample-only', action='store_true', help='only sample from a pretrained model')
+    parser.add_argument('--num-samples', type=int, default=10, help='number of samples to generate (if sampling only)')
+    parser.add_argument('--max-sample-len', type=int, default=100, help='max length of samples to generate (if sampling only)')
     args = parser.parse_args()
 
     device = ('cuda' if torch.cuda.is_available() else 'cpu') if args.device == 'auto' else args.device
@@ -304,7 +310,8 @@ if __name__ == '__main__':
     os.makedirs(args.work_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=args.work_dir)
 
-    train_set, test_set = create_datasets(args.input_file)
+    get_sentences = {'chars': get_char_sentences, 'latex': get_latex_sentences}[args.tokenizer]
+    train_set, test_set = create_datasets(args.input_file, get_sentences)
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4)
 
     config = ModelConfig(vocab_size=train_set.get_vocab_size(), block_size=train_set.get_output_length())
@@ -312,9 +319,9 @@ if __name__ == '__main__':
     model = Transformer(config).to(device)
 
     if args.resume or args.sample_only:
-        model.load_state_dict(torch.load(os.path.join(args.work_dir, 'model.pt')))
+        model.load_state_dict(torch.load(os.path.join(args.work_dir, args.model_file)))
     if args.sample_only:
-        print_samples(num=50)
+        print_samples(num=args.num_samples, max_len=args.max_sample_len)
         exit()
 
     print(f"model #params: {sum(p.numel() for p in model.parameters())}")
