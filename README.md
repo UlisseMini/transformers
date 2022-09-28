@@ -11,7 +11,13 @@ Hand-written transformers for learning purposes. Written after reading Karpathy'
 
 Training on the [stacks project](https://github.com/stacks/stacks-project) (~730k LOC) with ~2M param model (4 layers, 4 heads, 64 dim embeddings.)
 
-Ideally there'd be more data, [Chinchilla](https://arxiv.org/pdf/2203.15556.pdf) found that you want ~10-20x more tokens then parameters for big models, my model is tiny but the direction should be qualitatively correct. Maybe I'll test this.
+```sh
+python main.py --input-file='data/stacks.tex' --tokenizer='latex' --batch-size=96
+```
+
+The model is small, but according to [Chinchilla](https://arxiv.org/pdf/2203.15556.pdf) you want ~10-20x more tokens then parameters, which I don't have. (Extrapolating Chinchilla to tiny models is sketchy, but better then nothing. might test this later.)
+
+Results from 20 minutes of training on my GTX 1070:
 
 ![loss curves](images/stacks-loss.png)
 
