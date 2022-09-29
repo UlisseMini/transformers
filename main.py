@@ -4,7 +4,7 @@ import argparse
 import os
 from dataclasses import dataclass
 from tqdm import tqdm
-from utils import get_char_sentences, get_latex_sentences
+import utils
 
 
 import torch
@@ -130,7 +130,7 @@ class Transformer(nn.Module):
 
         loss = None
         if targets is not None:
-            # flatten stuff
+            # flatten batch dim and sequence dim
             # logits   (B, T, vocab_size)
             # logits'  (B*T, vocab_size)
             # targets' (B*T)
@@ -144,10 +144,6 @@ class Transformer(nn.Module):
 
 # Mostly stolen from makemore, becuase data wrangling is boring. Thanks karpathy!
 
-#     tokens = data.split(sentences)
-#     tokens = [w.strip() sentences w in tokens] # get rid of any leading or trailing white space
-#     return sentences
-
 class TokenDataset(Dataset):
     def __init__(self, sentences, vocab, max_sentence_length):
         self.sentences = sentences
@@ -155,6 +151,8 @@ class TokenDataset(Dataset):
         self.max_sentence_length = max_sentence_length
         self.stoi = {tok:i+1 for i,tok in enumerate(vocab)}
         self.itos = {i:s for s,i in self.stoi.items()} # inverse mapping
+        # FIXME: This is a hack for --no-crop, which is buggy
+        self.itos[0] = '\n'
 
     def __len__(self):
         return len(self.sentences)
@@ -173,8 +171,7 @@ class TokenDataset(Dataset):
         ix = torch.tensor([self.stoi[tok] for tok in sentence], dtype=torch.long)
         return ix
 
-    def decode(self, ix, join_char=''):
-        # TODO: Allow tokenizer to control join_char (or better, join_fn)
+    def decode(self, ix):
         return ''.join(self.itos[i] for i in ix)
 
     def __getitem__(self, idx):
@@ -189,6 +186,7 @@ class TokenDataset(Dataset):
 
 
 def create_datasets(input_file, get_sentences):
+    print('Creating datasets...')
     # read and clean up data
     with open(input_file, 'r') as f:
         data = f.read()
@@ -216,7 +214,7 @@ def create_datasets(input_file, get_sentences):
 
 
 @torch.no_grad()
-def generate(model, idx, max_new_tokens, tempature=0.7, top_k=None, do_sample=False):
+def generate(model, idx, max_new_tokens, tempature=0.7, crop=True, top_k=None, do_sample=False):
     """
     Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
     the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -241,31 +239,46 @@ def generate(model, idx, max_new_tokens, tempature=0.7, top_k=None, do_sample=Fa
             idx_next = torch.multinomial(probs, num_samples=1)
         else:
             _, idx_next = torch.topk(probs, k=1, dim=-1)
-        # append sampled index to the running sequence and continue
-        if (idx_next == 0).all():
+        # break if all samplers have returned end token
+        # FIXME: if crop=False then we should replace 0 with '\n' or something.
+        if crop and (idx_next == 0).all():
             break
+        # append sampled index to the running sequence and continue
         idx = torch.cat((idx, idx_next), dim=1)
 
     return idx
     
 
 
-def print_samples(num, max_len):
-    X_init = torch.zeros(num, 1, dtype=torch.long).to(device)
+def get_samples(args, prompt_idx=None):
+    num = args.num_samples
+    max_len = args.max_sample_len
     top_k = args.top_k if args.top_k != -1 else None
-    X_samp = generate(model, X_init, max_len, top_k=top_k, do_sample=True).to('cpu')
+    crop = not args.no_crop
+
+    prompt_len = 0 if prompt_idx is None else len(prompt_idx)
+    X_init = torch.zeros(num, 1+prompt_len, dtype=torch.long).to(device)
+    if prompt_idx is not None:
+        X_init[:, 1:] = prompt_idx
+    X_samp = generate(model, X_init, max_len, crop=crop, top_k=top_k, do_sample=True)
+
     samples = []
     for i in tqdm(range(X_samp.size(0))): # iter over batches
         row = X_samp[i, 1:].tolist() # skip <START> token
-        crop_index = row.index(0) if 0 in row else len(row)
+        crop_index = row.index(0) if 0 in row and crop else len(row)
         row = row[:crop_index]
         word_samp = train_set.decode(row)
         samples.append(word_samp)
     
+
+    return samples
+
+
+def print_samples(samples):
     print('=' * 80)
     for sample in samples:
         print(sample)
-    print('=' * 80)
+        print(('-' if sample != samples[-1] else '=') * 80)
 
 
 @torch.inference_mode()
@@ -302,6 +315,9 @@ if __name__ == '__main__':
     parser.add_argument('--sample-only', action='store_true', help='only sample from a pretrained model')
     parser.add_argument('--num-samples', type=int, default=10, help='number of samples to generate (if sampling only)')
     parser.add_argument('--max-sample-len', type=int, default=100, help='max length of samples to generate (if sampling only)')
+    parser.add_argument('--no-crop', action='store_true', help='don\'t crop outputs to first <END> token (if sampling only) [BUGGY]')
+    parser.add_argument('--playground', action='store_true', help='run a playground for interactive sampling')
+    parser.add_argument('--join-sentences', type=int, default=1, help='join sentences into a single sequence')
     args = parser.parse_args()
 
     device = ('cuda' if torch.cuda.is_available() else 'cpu') if args.device == 'auto' else args.device
@@ -310,7 +326,13 @@ if __name__ == '__main__':
     os.makedirs(args.work_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=args.work_dir)
 
-    get_sentences = {'chars': get_char_sentences, 'latex': get_latex_sentences}[args.tokenizer]
+    _get_sentences = {'chars': utils.get_char_sentences, 'latex': utils.get_latex_sentences}[args.tokenizer]
+    def get_sentences(data):
+        sentences = _get_sentences(data)
+        if args.join_sentences > 1:
+            sentences = utils.join_sentences(sentences, args.join_sentences)
+        return sentences
+
     train_set, test_set = create_datasets(args.input_file, get_sentences)
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4)
 
@@ -320,8 +342,15 @@ if __name__ == '__main__':
 
     if args.resume or args.sample_only:
         model.load_state_dict(torch.load(os.path.join(args.work_dir, args.model_file)))
+    if args.playground:
+        while True:
+            print('Enter a prompt:')
+            prompt = input('> ').strip()
+            samples = get_samples(args, prompt_idx=train_set.encode(prompt))
+            print_samples(samples)
+
     if args.sample_only:
-        print_samples(num=args.num_samples, max_len=args.max_sample_len)
+        print_samples(get_samples(args))
         exit()
 
     print(f"model #params: {sum(p.numel() for p in model.parameters())}")
